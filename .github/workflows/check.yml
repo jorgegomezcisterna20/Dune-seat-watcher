@@ -17,8 +17,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Instalar dependencias
+      - name: Instalar dependencias de Python
         run: pip install -r requirements.txt
+
+      - name: Recuperar navegador Chromium desde cache
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Instalar navegador Chromium para Playwright
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
 
       - name: Restaurar el ultimo estado guardado
         uses: actions/cache@v4
