@@ -1,0 +1,35 @@
+name: Monitor Preventa Dune Chile (Cinemark y Cinepolis)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el codigo del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install requests
+
+      - name: Restaurar el ultimo estado guardado
+        uses: actions/cache@v4
+        with:
+          path: chile_state.json
+          key: chile-preventa-state-${{ github.run_id }}
+          restore-keys: |
+            chile-preventa-state-
+
+      - name: Revisar preventa y avisar si corresponde
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python chile_preventa.py
