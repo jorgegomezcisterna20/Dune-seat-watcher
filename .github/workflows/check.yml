@@ -5,34 +5,51 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+# Evita que dos revisiones corran al mismo tiempo (y te lleguen avisos repetidos).
+concurrency:
+  group: monitor-dune-amc
+  cancel-in-progress: false
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Version fija de Ubuntu: GitHub va a cambiar "ubuntu-latest" a Ubuntu 26
+    # desde el 19-10-2026 y asi evitamos sorpresas.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # solo para el ultimo paso ("Mantener vivo el robot")
     steps:
       - name: Descargar el codigo del repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Instalar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
       - name: Instalar dependencias de Python
-        run: pip install -r requirements.txt
+        run: pip install --disable-pip-version-check -r requirements.txt
 
+      - name: Ver que version de Playwright quedo instalada
+        id: playwright
+        run: echo "version=$(python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
+
+      # El navegador guardado queda marcado con la version de Playwright. Si
+      # Playwright cambia de version, se descarga el navegador que corresponde.
+      # (Esto es lo que fallo desde el 15-09-2026.)
       - name: Recuperar navegador Chromium desde cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}
+          key: playwright-chromium-${{ runner.os }}-${{ steps.playwright.outputs.version }}
 
       - name: Instalar navegador Chromium para Playwright
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
+        run: python -m playwright install --with-deps --only-shell chromium
 
       - name: Restaurar el ultimo estado guardado
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: state.json
           key: dune-watch-state-${{ github.run_id }}
@@ -44,3 +61,19 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python check_dune.py
+
+      # GitHub apaga solos los robots programados de los repositorios publicos
+      # que pasan 60 dias sin cambios. Cada 45 dias este paso hace un cambio
+      # vacio ("Mantener activo el monitor") para que eso no pase.
+      - name: Mantener vivo el robot
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        run: |
+          dias=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "Dias desde el ultimo cambio en el repositorio: $dias"
+          if [ "$dias" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Mantener activo el monitor (automatico)"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi

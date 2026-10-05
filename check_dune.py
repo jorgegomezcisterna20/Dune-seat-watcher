@@ -1,263 +1,277 @@
 """
-Monitor de fechas disponibles para "Dune: Part Three" en AMC Lincoln Square 13,
-mas busqueda automatica de vuelos SCL-NYC para esas fechas.
+Monitor de fechas para "Dune: Part Three" en AMC Lincoln Square 13.
 
-Que hace, cada 15 minutos:
-1. Revisa la pagina publica de horarios del teatro en Atom Tickets.
-2. Busca todas las fechas que aparecen para la funcion de Dune: Part Three.
-3. Si aparece una fecha CONFIRMADA posterior al 13 de enero de 2027:
-   a) Calcula la ventana de vuelo: ida un dia antes, vuelta 1 o 2 dias
-      despues (el que salga mas barato).
-   b) Busca vuelos SCL-NYC en Amadeus para esas fechas.
-   c) Manda un aviso por Telegram con la fecha confirmada y el mejor vuelo.
-4. Ademas, cada 4 horas (no cada 15 minutos, para no gastar de mas la cuota
-   gratis de Amadeus), busca vuelos para una fecha ESTIMADA: el dia
-   siguiente a la ultima fecha confirmada (hoy, 14 de enero de 2027). Si
-   aparece un precio bueno, avisa de inmediato, sin esperar a que la
-   funcion se confirme oficialmente.
+Que hace cada vez que corre (cada 15 minutos, en los servidores de GitHub):
+1. Abre la pagina publica de horarios del teatro en Atom Tickets con un
+   navegador invisible (Playwright) y lee hasta que fecha se venden
+   entradas para Dune: Part Three.
+2. Si aparece una fecha posterior a la ultima conocida (al principio, el
+   13 de enero de 2027), te avisa por Telegram para que entres a comprar.
+3. Una vez por semana te manda un mensaje corto confirmando que sigue
+   funcionando. Si pasa mas de una semana sin ese mensaje, algo paso.
+4. Si falla varias veces seguidas, te avisa por Telegram con el error
+   (maximo una vez cada 12 horas) y te vuelve a escribir cuando se recupera.
 
 No entra a la pagina de compra ni al mapa de butacas: solo lee la pagina
-publica de horarios, que es la parte del sitio que permite ser consultada
-por un programa. La busqueda de vuelos usa la API oficial de Amadeus para
-desarrolladores, no scraping.
+publica de horarios.
 """
 
+import json
 import os
 import re
-import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
-MOVIE_ID = "359230"
-VENUE_ID = "164"
+# --- Configuracion -----------------------------------------------------------
+
+MOVIE_ID = "359230"  # Dune: Part Three en Atom Tickets
 THEATER_URL = "https://www.atomtickets.com/theaters/amc-lincoln-square-13/164"
-CUTOFF_DATE = datetime(2027, 1, 13)
+CUTOFF_DATE = datetime(2027, 1, 13)  # ultima fecha a la venta cuando se armo el robot
 STATE_FILE = "state.json"
+USER_AGENT = "Mozilla/5.0 (compatible; DuneSeatWatcher/1.0; personal use, low frequency)"
+RECORDATORIO_BUTACAS = "Recuerda: fila G a J, butacas 10 a 22."
 
-FLIGHT_ORIGIN = "SCL"
-FLIGHT_DESTINATION = "NYC"
-FLIGHT_BUDGET_IDEAL_USD = 600
-FLIGHT_BUDGET_SOFT_USD = 650
-FLIGHT_CHECK_INTERVAL_HOURS = 4
-AMADEUS_BASE_URL = "https://test.api.amadeus.com"
+FALLAS_ANTES_DE_AVISAR = 3  # 3 revisiones fallidas seguidas = unos 45 minutos
+HORAS_ENTRE_AVISOS_DE_FALLA = 12
+DIAS_ENTRE_MENSAJES_SEMANALES = 7
+
+# Encuentra las fechas en los links de la pagina, que se ven asi:
+#   /movies/359230/showtimes?localDate=2027-01-13T02%3A00%3A00-05%3A00&venueId=164
+# Tambien acepta los mismos links escritos de forma "escapada" (\/, %2F, etc.).
+PATRON_FECHA = re.compile(
+    r"movies(?:/|\\/|%2F)" + MOVIE_ID
+    + r"(?:/|\\/|%2F)showtimes(?:\?|%3F|\\u003F)localDate(?:=|%3D|\\u003D)"
+    + r"(\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
 
 
-def send_telegram(message: str) -> None:
+# --- Utilidades ----------------------------------------------------------------
+
+def ahora() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def ocultar_secretos(texto: str) -> str:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
+    return texto.replace(token, "***") if len(token) >= 8 else texto
+
+
+def primera_linea(texto: str, largo: int = 300) -> str:
+    lineas = [l.strip() for l in str(texto).splitlines() if l.strip()]
+    return ocultar_secretos(lineas[0] if lineas else "(sin detalle)")[:largo]
+
+
+def nota_en_github(nivel: str, titulo: str, mensaje: str) -> None:
+    """Deja una nota visible en la pagina de la ejecucion (pestana Actions de GitHub)."""
+    def limpiar(texto: str) -> str:
+        texto = ocultar_secretos(texto)
+        return texto.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+    titulo = limpiar(titulo).replace(":", "%3A").replace(",", "%2C")
+    print(f"::{nivel} title={titulo}::{limpiar(mensaje)}")
+
+
+def send_telegram(message: str, obligatorio: bool = True) -> bool:
+    """Manda un mensaje por Telegram.
+
+    Si el mensaje es obligatorio y no se puede mandar, la ejecucion termina con
+    error (queda en rojo en GitHub) para que se reintente en la proxima revision.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
-        print("Faltan las variables TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
+        nota_en_github(
+            "error",
+            "Faltan los datos de Telegram",
+            "No estan los secretos TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID "
+            "(Settings > Secrets and variables > Actions).",
+        )
         sys.exit(1)
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    response = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=30)
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": message},
+            timeout=30,
+        )
+        if response.ok:
+            return True
+        detalle = f"Codigo {response.status_code}: {response.text[:300]}"
+    except requests.RequestException as error:
+        detalle = str(error)
+
+    nota_en_github("error" if obligatorio else "warning", "Telegram no acepto el mensaje", detalle)
+    if obligatorio:
+        sys.exit(1)
+    return False
 
 
-def load_state() -> dict:
-    default_state = {
+# --- Estado (lo que el robot recuerda entre una revision y otra) ---------------
+
+def leer_estado() -> dict:
+    estado = {
         "max_date_seen": CUTOFF_DATE.isoformat(),
-        "last_flight_check": None,
-        "best_flight_price_alerted": None,
+        "fallas_seguidas": 0,
+        "ultimo_aviso_falla": None,
+        "ultimo_mensaje_semanal": None,
     }
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            default_state.update(data)
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return default_state
+                guardado = json.load(f)
+            if isinstance(guardado, dict):
+                estado.update({k: v for k, v in guardado.items() if k in estado})
+        except (OSError, ValueError):
+            print("No se pudo leer el estado guardado; se parte de cero.")
+    return estado
 
 
-def save_state(state: dict) -> None:
+def guardar_estado(estado: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+        json.dump(estado, f, indent=2)
 
 
-def get_available_dates() -> list[datetime]:
+# --- Revision de la pagina ------------------------------------------------------
+
+def extraer_fechas(html: str) -> list[datetime]:
+    return sorted({datetime.strptime(d, "%Y-%m-%d") for d in PATRON_FECHA.findall(html)})
+
+
+def leer_fechas_disponibles() -> list[datetime]:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch(args=["--no-sandbox"])
-        page = browser.new_page(user_agent="Mozilla/5.0 (compatible; DuneSeatWatcher/1.0; personal use, low frequency)")
-        page.goto(THEATER_URL, wait_until="networkidle", timeout=60000)
-        html = page.content()
-        browser.close()
+        try:
+            page = browser.new_page(user_agent=USER_AGENT)
+            respuesta = page.goto(THEATER_URL, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_selector(
+                    f'a[href*="/movies/{MOVIE_ID}/showtimes"]', state="attached", timeout=30000
+                )
+            except PlaywrightTimeout:
+                pass  # se revisa igual lo que alcanzo a cargar
+            html = page.content()
+            codigo = respuesta.status if respuesta else "sin respuesta"
+            titulo = page.title()
+        finally:
+            browser.close()
 
-    pattern = rf"/movies/{MOVIE_ID}/showtimes\?localDate=(\d{{4}}-\d{{2}}-\d{{2}})"
-    matches = re.findall(pattern, html)
-
-    if not matches:
-        print(f"[Diagnostico] Largo del HTML recibido: {len(html)} caracteres")
-        print(f"[Diagnostico] Contiene 'Dune'?: {'Dune' in html}")
-        print(f"[Diagnostico] Contiene el ID de pelicula {MOVIE_ID}?: {MOVIE_ID in html}")
-        print(f"[Diagnostico] Contiene 'Pre-order'?: {'Pre-order' in html}")
-
-    return [datetime.strptime(d, "%Y-%m-%d") for d in matches]
-
-
-def get_amadeus_token() -> str:
-    client_id = os.environ.get("AMADEUS_API_KEY")
-    client_secret = os.environ.get("AMADEUS_API_SECRET")
-
-    if not client_id or not client_secret:
-        print("Faltan las variables AMADEUS_API_KEY o AMADEUS_API_SECRET.")
-        return ""
-
-    response = requests.post(
-        f"{AMADEUS_BASE_URL}/v1/security/oauth2/token",
-        data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json()["access_token"]
+    fechas = extraer_fechas(html)
+    if not fechas:
+        raise RuntimeError(
+            "La pagina cargo pero no aparece ninguna fecha de Dune: Part Three "
+            f"(codigo {codigo}, titulo '{titulo}', {len(html)} caracteres, "
+            f"menciona Dune: {'si' if 'dune' in html.lower() else 'no'}). "
+            "Puede que la pagina haya cambiado o que este bloqueando al robot."
+        )
+    return fechas
 
 
-def search_flights(token: str, departure_date: datetime, return_date: datetime, nonstop: bool) -> list:
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {
-        "originLocationCode": FLIGHT_ORIGIN,
-        "destinationLocationCode": FLIGHT_DESTINATION,
-        "departureDate": departure_date.strftime("%Y-%m-%d"),
-        "returnDate": return_date.strftime("%Y-%m-%d"),
-        "adults": 1,
-        "currencyCode": "USD",
-        "max": 5,
-        "nonStop": "true" if nonstop else "false",
-    }
-    response = requests.get(f"{AMADEUS_BASE_URL}/v2/shopping/flight-offers", headers=headers, params=params, timeout=30)
-    if response.status_code != 200:
-        print(f"[Diagnostico vuelos] Amadeus respondio {response.status_code} para {params}")
-        return []
-    return response.json().get("data", [])
+# --- Avisos ------------------------------------------------------------------------
 
+def avisar_si_hay_fechas_nuevas(estado: dict, fechas: list[datetime]) -> None:
+    fecha_max = fechas[-1]
+    fecha_conocida = max(datetime.fromisoformat(estado["max_date_seen"]), CUTOFF_DATE)
 
-def describe_offer(offer: dict) -> str:
-    price = offer["price"]["total"]
-    currency = offer["price"]["currency"]
-    segments = offer["itineraries"][0]["segments"]
-    carriers = sorted({seg["carrierCode"] for it in offer["itineraries"] for seg in it["segments"]})
-    stops = len(segments) - 1
-    tipo = "directo" if stops == 0 else f"{stops} escala(s)"
-    return f"{currency} {price} ({tipo}, aerolinea(s): {', '.join(carriers)})"
+    print(f"Ultima fecha conocida:        {fecha_conocida:%d-%m-%Y}")
+    print(f"Ultima fecha a la venta hoy:  {fecha_max:%d-%m-%Y}")
 
-
-def budget_label(precio: float) -> str:
-    if precio <= FLIGHT_BUDGET_IDEAL_USD:
-        return "dentro de tu presupuesto ideal"
-    if precio <= FLIGHT_BUDGET_SOFT_USD:
-        return "un poco mas alto que tu ideal, pero podria valer la pena (revisa aerolinea y horario)"
-    return f"bastante sobre tu presupuesto (tope blando: USD {FLIGHT_BUDGET_SOFT_USD})"
-
-
-def find_best_flight(movie_date: datetime):
-    token = get_amadeus_token()
-    if not token:
-        return None, "No se pudo consultar vuelos (faltan credenciales de Amadeus)."
-
-    departure_date = movie_date - timedelta(days=1)
-    return_options = [movie_date + timedelta(days=1), movie_date + timedelta(days=2)]
-
-    best_offer = None
-    best_return = None
-
-    for return_date in return_options:
-        offers = search_flights(token, departure_date, return_date, nonstop=True)
-        if not offers:
-            offers = search_flights(token, departure_date, return_date, nonstop=False)
-        if not offers:
-            continue
-        cheapest = min(offers, key=lambda o: float(o["price"]["total"]))
-        if best_offer is None or float(cheapest["price"]["total"]) < float(best_offer["price"]["total"]):
-            best_offer = cheapest
-            best_return = return_date
-
-    if not best_offer:
-        texto = f"No se encontraron vuelos SCL-NYC para el {departure_date.strftime('%d-%m-%Y')} (ida) por ahora."
-        return None, texto
-
-    detalle = describe_offer(best_offer)
-    precio = float(best_offer["price"]["total"])
-    etiqueta = budget_label(precio)
-    texto = f"Vuelo SCL-NYC ida {departure_date.strftime('%d-%m-%Y')} / vuelta {best_return.strftime('%d-%m-%Y')}: {detalle} -- {etiqueta}."
-    return precio, texto
-
-
-def check_confirmed_date(state: dict) -> bool:
-    """Revisa si AMC confirmo una fecha nueva. Devuelve True si mando aviso."""
-    dates = get_available_dates()
-
-    if not dates:
-        print("""No se encontraron fechas para Dune: Part Three en esta revision. Puede que la estructura de la pagina haya cambiado, o que la funcion ya no aparezca listada con 'Pre-order'.""")
-        return False
-
-    current_max = max(dates)
-    known_max = datetime.fromisoformat(state["max_date_seen"])
-
-    print(f"Fecha maxima conocida hasta ahora: {known_max.strftime('%d-%m-%Y')}")
-    print(f"Fecha maxima encontrada hoy:       {current_max.strftime('%d-%m-%Y')}")
-
-    if current_max > known_max:
-        _, vuelo_info = find_best_flight(current_max)
-        mensaje = f"""AMC Lincoln Square 13 abrio nuevas fechas para Dune: Part Three! Ahora se puede comprar hasta el {current_max.strftime('%d-%m-%Y')}. Entra a comprar aqui: {THEATER_URL}
-
-{vuelo_info}"""
-        send_telegram(mensaje)
-        state["max_date_seen"] = current_max.isoformat()
-        state["best_flight_price_alerted"] = None
-        print("Aviso de fecha CONFIRMADA enviado por Telegram.")
-        print(vuelo_info)
-        return True
-
-    print("Sin novedades en la fecha de la funcion.")
-    return False
-
-
-def check_estimated_flight(state: dict) -> None:
-    """Revisa vuelos para la fecha estimada (dia siguiente al ultimo confirmado)."""
-    last_check_raw = state.get("last_flight_check")
-    if last_check_raw:
-        last_check = datetime.fromisoformat(last_check_raw)
-        horas_pasadas = (datetime.utcnow() - last_check).total_seconds() / 3600
-        if horas_pasadas < FLIGHT_CHECK_INTERVAL_HOURS:
-            print(f"Chequeo de vuelo estimado se salta (ultimo hace {horas_pasadas:.1f}h, se revisa cada {FLIGHT_CHECK_INTERVAL_HOURS}h).")
-            return
-
-    known_max = datetime.fromisoformat(state["max_date_seen"])
-    fecha_estimada = known_max + timedelta(days=1)
-
-    print(f"Revisando vuelos para fecha ESTIMADA: {fecha_estimada.strftime('%d-%m-%Y')}")
-    precio, vuelo_info = find_best_flight(fecha_estimada)
-    state["last_flight_check"] = datetime.utcnow().isoformat()
-
-    if precio is None:
-        print(vuelo_info)
+    if fecha_max <= fecha_conocida:
+        print("Sin novedades.")
         return
 
-    mejor_previo = state.get("best_flight_price_alerted")
-    ya_avisado_mejor = mejor_previo is not None and precio >= mejor_previo
+    nuevas = ", ".join(f"{f:%d-%m-%Y}" for f in fechas if f > fecha_conocida)
+    send_telegram(
+        "🎬 ¡AMC Lincoln Square 13 abrió nuevas fechas para Dune: Part Three!\n\n"
+        f"Ahora se puede comprar hasta el {fecha_max:%d-%m-%Y}.\n"
+        f"Fechas nuevas: {nuevas}\n\n"
+        f"Entra a comprar aquí: {THEATER_URL}\n"
+        f"{RECORDATORIO_BUTACAS}"
+    )
+    estado["max_date_seen"] = fecha_max.isoformat()
+    print("Aviso de fechas nuevas enviado por Telegram.")
+    nota_en_github("notice", "Fechas nuevas", f"Ahora se vende hasta el {fecha_max:%d-%m-%Y}. Aviso enviado.")
 
-    if precio <= FLIGHT_BUDGET_SOFT_USD and not ya_avisado_mejor:
-        mensaje = f"""Vuelo estimado para tu viaje a ver Dune: Part Three (fecha de funcion aun no confirmada, se estima {fecha_estimada.strftime('%d-%m-%Y')} o cercana):
 
-{vuelo_info}"""
-        send_telegram(mensaje)
-        state["best_flight_price_alerted"] = precio
-        print("Aviso de vuelo ESTIMADO enviado por Telegram.")
-    else:
-        print(vuelo_info)
+def registrar_falla(estado: dict, error: Exception) -> None:
+    detalle = primera_linea(f"{type(error).__name__}: {error}")
+    estado["fallas_seguidas"] = int(estado.get("fallas_seguidas") or 0) + 1
+    n = estado["fallas_seguidas"]
 
+    print(f"No se pudo revisar la pagina (falla {n} seguida). Detalle completo:")
+    print(ocultar_secretos(str(error)))
+    nota_en_github("warning", "El robot no pudo revisar la pagina", detalle)
+
+    if n < FALLAS_ANTES_DE_AVISAR:
+        print(f"Todavia no se avisa por Telegram (se avisa desde la falla {FALLAS_ANTES_DE_AVISAR} seguida).")
+        return
+
+    ultimo = estado.get("ultimo_aviso_falla")
+    if ultimo and ahora() - datetime.fromisoformat(ultimo) < timedelta(hours=HORAS_ENTRE_AVISOS_DE_FALLA):
+        print("Ya se aviso de esta falla hace menos de 12 horas; no se repite el aviso todavia.")
+        return
+
+    send_telegram(
+        "⚠️ El robot de Dune no está pudiendo revisar la página de AMC "
+        f"({n} intentos seguidos fallidos).\n\n"
+        f"Error: {detalle}\n\n"
+        "Si este aviso se repite, copia este mensaje cuando pidas ayuda. "
+        "Te escribo de nuevo cuando vuelva a funcionar."
+    )
+    estado["ultimo_aviso_falla"] = ahora().isoformat()
+    print("Aviso de falla enviado por Telegram.")
+
+
+def registrar_exito(estado: dict) -> None:
+    if estado.get("ultimo_aviso_falla"):
+        if send_telegram(
+            "✅ El robot de Dune volvió a funcionar. Sigo vigilando AMC cada 15 minutos.",
+            obligatorio=False,
+        ):
+            estado["ultimo_aviso_falla"] = None
+            estado["ultimo_mensaje_semanal"] = ahora().isoformat()
+    estado["fallas_seguidas"] = 0
+
+
+def mensaje_semanal(estado: dict, fechas: list[datetime]) -> None:
+    ultimo = estado.get("ultimo_mensaje_semanal")
+    if ultimo and ahora() - datetime.fromisoformat(ultimo) < timedelta(days=DIAS_ENTRE_MENSAJES_SEMANALES):
+        return
+
+    if send_telegram(
+        "🤖 Sigo vigilando AMC Lincoln Square 13 cada 15 minutos.\n"
+        f"Por ahora Dune: Part Three se vende hasta el {fechas[-1]:%d-%m-%Y}. "
+        "Te aviso apenas abran fechas nuevas.\n\n"
+        "(Este mensaje llega una vez por semana. Si pasa más de una semana sin "
+        "recibirlo, algo le pasó al robot.)",
+        obligatorio=False,
+    ):
+        estado["ultimo_mensaje_semanal"] = ahora().isoformat()
+        print("Mensaje semanal enviado por Telegram.")
+
+
+# --- Programa principal -------------------------------------------------------------
 
 def main() -> None:
-    state = load_state()
-    hubo_fecha_confirmada = check_confirmed_date(state)
-    if not hubo_fecha_confirmada:
-        check_estimated_flight(state)
-    save_state(state)
+    estado = leer_estado()
+
+    try:
+        fechas = leer_fechas_disponibles()
+    except Exception as error:  # cualquier problema al leer la pagina
+        registrar_falla(estado, error)
+    else:
+        avisar_si_hay_fechas_nuevas(estado, fechas)
+        registrar_exito(estado)
+        mensaje_semanal(estado, fechas)
+        nota_en_github("notice", "Revision OK", f"Dune: Part Three se vende hasta el {fechas[-1]:%d-%m-%Y}")
+
+    guardar_estado(estado)
 
 
 if __name__ == "__main__":

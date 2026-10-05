@@ -12,6 +12,15 @@ No revisa butacas específicas (eso está bloqueado por el sitio, como ya
 conversamos) — te avisa apenas se abra una fecha nueva, y ahí entras tú a
 elegir la butaca entre fila G-J y columna 10-22.
 
+## Mensajes que te pueden llegar por Telegram
+
+- 🎬 **Fechas nuevas**: AMC abrió la venta después del 13 de enero. ¡A comprar!
+- 🤖 **Mensaje semanal**: "Sigo vigilando...". Llega una vez por semana. Si
+  pasa más de una semana sin recibirlo, algo le pasó al robot.
+- ⚠️ **Falla**: el robot no pudo revisar la página varias veces seguidas
+  (máximo un aviso cada 12 horas). Incluye el error, para que pidas ayuda.
+- ✅ **Recuperado**: el robot volvió a funcionar después de una falla.
+
 ---
 
 ## Paso 1: Crear tu bot de Telegram (5 minutos)
@@ -63,10 +72,9 @@ código.
    Square 13".
 3. Click en él, y luego en el botón **Run workflow** para probarlo
    manualmente (no hace falta esperar los 15 minutos).
-4. Si todo quedó bien configurado, no deberías recibir ningún mensaje aún
-   (porque hoy la fecha máxima sigue siendo el 13 de enero) — pero puedes
-   revisar el log de la ejecución para confirmar que dice algo como:
-   `Fecha máxima encontrada hoy: 13-01-2027` sin errores.
+4. Si todo quedó bien configurado, te llega por Telegram el mensaje 🤖
+   "Sigo vigilando..." y la ejecución queda con un ✓ verde. En el log
+   debería decir algo como `Ultima fecha a la venta hoy: 13-01-2027`.
 
 A partir de ahí, el robot queda revisando solo cada 15 minutos. El día que
 AMC abra fechas después del 13 de enero, te va a llegar un mensaje de
@@ -74,21 +82,26 @@ Telegram al instante.
 
 ---
 
-## ⚠️ Una limitación importante de GitHub que debes saber
+## Los 60 días de GitHub (ya resuelto solo)
 
-GitHub **desactiva automáticamente** los workflows programados (los que
-corren solos con horario) si el repositorio no tiene ninguna actividad
-(ningún "commit") durante **60 días seguidos**.
+GitHub **desactiva automáticamente** los workflows programados de los
+repositorios públicos si pasan **60 días seguidos** sin ningún cambio
+("commit").
 
-Como estamos hablando de un período de varios meses (de aquí a enero
-2027), te recomiendo:
+Para que eso no pase, el mismo robot hace un cambio vacío cada 45 días.
+Vas a ver en el historial commits llamados
+`Mantener activo el monitor (automatico)`: son normales, no los borres.
 
-- Poner un recordatorio cada ~45 días para entrar a tu repositorio y
-  hacer cualquier cambio mínimo (por ejemplo, editar este mismo README y
-  guardar), o
-- Simplemente revisar cada mes y medio que en la pestaña **Actions** el
-  workflow siga en estado "activo" (si aparece un aviso de que fue
-  deshabilitado, hay un botón para reactivarlo con un clic).
+Si aun así algún día aparece en la pestaña **Actions** un aviso de que el
+workflow fue deshabilitado, hay un botón para reactivarlo con un clic.
+
+## Historial de arreglos
+
+- **05-10-2026**: desde el 15-09-2026 el robot fallaba en cada revisión.
+  Ese día salió una versión nueva de Playwright y el robot seguía usando un
+  navegador guardado de la versión anterior. Ahora el navegador guardado
+  queda marcado con su versión, Playwright quedó fijo en una versión, y el
+  robot avisa por Telegram si vuelve a fallar.
 
 ## Si en algún momento quieres cambiar el criterio
 
